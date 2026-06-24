@@ -1,0 +1,10 @@
+node_modules
+.next
+.git
+.env
+.env.local
+.env*.local
+schema-dump.json
+schema-report.md
+docker/rclone.conf
+npm-debug.log*

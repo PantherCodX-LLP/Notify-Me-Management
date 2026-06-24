@@ -1,0 +1,6 @@
+# Copy this to  docker/rclone.conf  (a FILE, not a folder) and replace the token
+# with the real one from `rclone config`. The remote MUST be named "gdrive".
+[gdrive]
+type = drive
+scope = drive.readonly
+token = {"access_token":"REPLACE_ME","token_type":"Bearer","refresh_token":"REPLACE_ME","expiry":"2000-01-01T00:00:00Z"}

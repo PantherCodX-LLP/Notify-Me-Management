@@ -1,0 +1,65 @@
+services:
+  mysql:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-changeme}
+      MYSQL_DATABASE: app_bis
+    volumes:
+      - dbdata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD:-changeme}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_USER: root
+      DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:-changeme}
+      DB_NAME: app_bis
+      DB_SSL: "false"
+      DB_POOL_SIZE: "8"
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+    ports:
+      - "3000:3000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  importer:
+    build:
+      context: .
+      dockerfile: docker/importer.Dockerfile
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-changeme}
+      LIVE_DB: app_bis
+      STAGING_DB: app_bis_import
+      GDRIVE_REMOTE: ${GDRIVE_REMOTE:-gdrive}
+      GDRIVE_FOLDER_ID: ${GDRIVE_FOLDER_ID:-11hiUAwq5W4XW1hIAmETKHnHi5tkHjVI3}
+      IMPORT_HOUR: ${IMPORT_HOUR:-9}
+      IMPORT_MINUTE: ${IMPORT_MINUTE:-0}
+      IMPORT_ON_START: ${IMPORT_ON_START:-true}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./docker/rclone.conf:/config/rclone.conf:ro
+      - importstate:/state
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  dbdata:
+  importstate:
