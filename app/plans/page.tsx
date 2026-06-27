@@ -36,7 +36,7 @@ export default function BillingPage() {
         <>
           <div className="grid stats">
             <StatCard label="Active subscriptions" value={fmtNum(data.activeCharges)} icon="◆" tone="green" />
-            <StatCard label="Active recurring revenue" value={fmtMoney(data.activeRevenue)} icon="$" tone="indigo" hint="sum of active charge prices" />
+            <StatCard label="MRR (recurring revenue)" value={fmtMoney(data.activeRevenue)} icon="$" tone="indigo" hint="active charges · test excluded · annual ÷ 12" />
             <StatCard label="On trial" value={fmtNum(data.trials)} icon="⏳" tone="amber" />
             <StatCard label="Cancelled (all time)" value={fmtNum(data.cancelledCharges)} icon="✕" tone="red" />
           </div>
