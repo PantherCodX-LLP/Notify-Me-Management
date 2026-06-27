@@ -12,6 +12,7 @@ const LINKS = [
   { href: "/installs", label: "Installs", icon: "⬇" },
   { href: "/uninstalls", label: "Churn & Uninstalls", icon: "⤴" },
   { href: "/plans", label: "Plans & Billing", icon: "◆" },
+  { href: "/mrr", label: "MRR & Revenue", icon: "$" },
   { section: "Product" },
   { href: "/notifications", label: "Notifications", icon: "🔔" },
   { href: "/features", label: "Features", icon: "✦" },

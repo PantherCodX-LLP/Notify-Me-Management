@@ -43,8 +43,8 @@ export default function OverviewPage() {
           </div>
 
           <div className="grid stats" style={{ marginTop: 16 }}>
-            <StatCard label="Active recurring revenue" value={fmtMoney(data.revenue.activeRecurring)} icon="$" tone="green"
-              hint="sum of active charge prices" />
+            <StatCard label="MRR (recurring revenue)" value={fmtMoney(data.revenue.activeRecurring)} icon="$" tone="green"
+              hint="active charges · test excluded · annual ÷ 12" />
             <StatCard label="BIS revenue generated" value={fmtMoney(data.revenue.bisRevenue)} icon="↗" tone="indigo"
               hint={`${fmtNum(data.revenue.bisOrders)} orders`} />
             <StatCard label="Notification signups" value={fmtNum(data.notifications.signupsTotal)} icon="🔔" tone="amber" />

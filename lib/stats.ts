@@ -186,7 +186,7 @@ export async function getOverview() {
       num(
         (
           await scalarRow<{ c: number }>(
-            `SELECT COUNT(DISTINCT user_id) c FROM charges WHERE status='ACTIVE' AND deleted_at IS NULL`
+            `SELECT COUNT(DISTINCT user_id) c FROM charges WHERE status='ACTIVE' AND deleted_at IS NULL AND test=0`
           )
         ).c
       )
@@ -195,7 +195,9 @@ export async function getOverview() {
       num(
         (
           await scalarRow<{ c: number }>(
-            `SELECT SUM(price) c FROM charges WHERE status='ACTIVE' AND deleted_at IS NULL`
+            // True MRR: exclude test charges, normalize annual plans to monthly.
+            `SELECT SUM(CASE WHEN \`interval\`='ANNUAL' THEN price/12 ELSE price END) c
+               FROM charges WHERE status='ACTIVE' AND deleted_at IS NULL AND test=0`
           )
         ).c
       )
@@ -355,8 +357,8 @@ export async function getChurn() {
   ] = await Promise.all([
     safe(() => count("users", "deleted_at IS NOT NULL")),
     safe(() => monthly("users", "deleted_at", undefined, 12)),
-    safe(() => count("charges", "status='CANCELLED'")),
-    safe(() => monthly("charges", "cancelled_on", "status='CANCELLED'", 12)),
+    safe(() => count("charges", "status='CANCELLED' AND test=0")),
+    safe(() => monthly("charges", "cancelled_on", "status='CANCELLED' AND test=0", 12)),
     safe(() => groupCount("charges", "status", { limit: 10 })),
     safe(() =>
       query<{ label: string; c: number }>(
@@ -424,17 +426,19 @@ export async function getBilling() {
           WHERE u.deleted_at IS NULL GROUP BY label ORDER BY c DESC LIMIT 25`
       ).then((r) => r.map((x) => ({ label: x.label, count: num(x.c) })))
     ),
-    safe(() => count("charges", "status='ACTIVE' AND deleted_at IS NULL")),
-    safe(() => count("charges", "status='CANCELLED'")),
+    safe(() => count("charges", "status='ACTIVE' AND deleted_at IS NULL AND test=0")),
+    safe(() => count("charges", "status='CANCELLED' AND test=0")),
     safe(async () =>
       num(
         (await scalarRow<{ c: number }>(
-          `SELECT SUM(price) c FROM charges WHERE status='ACTIVE' AND deleted_at IS NULL`
+          // True MRR: exclude test charges, normalize annual plans to a monthly basis.
+          `SELECT SUM(CASE WHEN \`interval\`='ANNUAL' THEN price/12 ELSE price END) c
+             FROM charges WHERE status='ACTIVE' AND deleted_at IS NULL AND test=0`
         )).c
       )
     ),
-    safe(() => monthly("charges", "activated_on", undefined, 12)),
-    safe(() => count("charges", "trial_ends_on > NOW() AND status='ACTIVE'")),
+    safe(() => monthly("charges", "activated_on", "test=0", 12)),
+    safe(() => count("charges", "trial_ends_on > NOW() AND status='ACTIVE' AND test=0")),
     safe(async () =>
       num(
         (await scalarRow<{ c: number }>(`SELECT SUM(price) c FROM shopify_usage_base_charges`)).c
@@ -445,13 +449,15 @@ export async function getBilling() {
     safe(() => count("shop_current_plan_limits", "limit_reached = 1")),
   ]);
 
-  // revenue per active plan
+  // recurring revenue (MRR) per active plan — test excluded, annual normalized
   const revenueByPlan = await safe(() =>
     query(
       `SELECT COALESCE(p.name, c.name, '(unknown)') label,
-              COUNT(*) count, SUM(c.price) total, AVG(c.price) avg
+              COUNT(*) count,
+              SUM(CASE WHEN c.\`interval\`='ANNUAL' THEN c.price/12 ELSE c.price END) total,
+              AVG(CASE WHEN c.\`interval\`='ANNUAL' THEN c.price/12 ELSE c.price END) avg
          FROM charges c LEFT JOIN plans p ON p.id=c.plan_id
-        WHERE c.status='ACTIVE' AND c.deleted_at IS NULL
+        WHERE c.status='ACTIVE' AND c.deleted_at IS NULL AND c.test=0
         GROUP BY label ORDER BY total DESC LIMIT 25`
     ).then((r) =>
       r.map((x: any) => ({
@@ -478,6 +484,313 @@ export async function getBilling() {
       byMonth: usageByMonth || [],
     },
     limitReached,
+  };
+}
+
+// --------------------------------------------------------------------------
+// MRR (Monthly Recurring Revenue)
+// --------------------------------------------------------------------------
+// Correct MRR requires two things the naive "SUM(price) of active charges"
+// gets wrong:
+//   1. Test charges (charges.test = 1) are Shopify development/test
+//      subscriptions that are never really billed -> they must be EXCLUDED.
+//   2. Annual plans (charges.interval = 'ANNUAL') bill once a year, so their
+//      contribution to *monthly* recurring revenue is price / 12. Counting the
+//      full annual price as monthly massively overstates MRR.
+// Everything below is computed over RECURRING, non-test, non-deleted charges.
+
+/** Monthly-normalized value of a single charge (annual -> /12). */
+function monthlyValue(price: number, interval: string | null | undefined): number {
+  const p = num(price);
+  return String(interval).toUpperCase() === "ANNUAL" ? p / 12 : p;
+}
+
+function toTime(v: any): number | null {
+  if (v == null) return null;
+  const t = v instanceof Date ? v.getTime() : new Date(v).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+interface MrrCharge {
+  user_id: number;
+  chargeId: number;
+  price: number;
+  intv: string | null;
+  status: string | null;
+  plan: string;
+  test: boolean;
+  blocked: boolean;
+  activatedTs: number | null;
+  cancelledTs: number | null;
+}
+
+/**
+ * A merchant can have more than one row with status='ACTIVE' (e.g. a plan
+ * upgrade where the previous charge was never cancelled, or an outright
+ * duplicate). They only pay for ONE subscription, so MRR must count a single
+ * active charge per merchant — the most recently activated one. This reduces a
+ * list of active charges to one per user (latest activated_on, charge_id tiebreak).
+ */
+function latestPerMerchant(list: MrrCharge[]): MrrCharge[] {
+  const best = new Map<number, MrrCharge>();
+  for (const c of list) {
+    const cur = best.get(c.user_id);
+    if (
+      !cur ||
+      (c.activatedTs ?? 0) > (cur.activatedTs ?? 0) ||
+      ((c.activatedTs ?? 0) === (cur.activatedTs ?? 0) && c.chargeId > cur.chargeId)
+    ) {
+      best.set(c.user_id, c);
+    }
+  }
+  return Array.from(best.values());
+}
+
+export async function getMRR(months = 12) {
+  // Fetch BOTH real and test charges in one pass; we split them in JS so the
+  // by-plan detail can show test charges alongside the (test-excluded) MRR.
+  // Blocked merchants (meta_data.is_user_blocked) are flagged here and dropped
+  // below so they never count toward MRR.
+  const rows =
+    (await safe(() =>
+      query<any>(
+        `SELECT c.user_id, c.charge_id, c.price, c.\`interval\` AS intv, c.status, c.test,
+                c.activated_on, c.cancelled_on,
+                COALESCE(p.name, c.name, '(unknown)') AS plan,
+                (JSON_VALID(u.meta_data)
+                   AND LOWER(JSON_UNQUOTE(JSON_EXTRACT(u.meta_data,'$.is_user_blocked'))) IN ('1','true')) AS blocked
+           FROM charges c
+           LEFT JOIN plans p ON p.id = c.plan_id
+           LEFT JOIN users u ON u.id = c.user_id
+          WHERE c.type = 'RECURRING' AND c.deleted_at IS NULL`
+      )
+    )) || [];
+
+  // Drop blocked merchants entirely — we blocked them, so they are not revenue.
+  const charges: MrrCharge[] = rows
+    .map((r: any) => ({
+      user_id: num(r.user_id),
+      chargeId: num(r.charge_id),
+      price: num(r.price),
+      intv: r.intv,
+      status: r.status,
+      plan: r.plan || "(unknown)",
+      test: num(r.test) === 1,
+      blocked: num(r.blocked) === 1,
+      activatedTs: toTime(r.activated_on),
+      cancelledTs: toTime(r.cancelled_on),
+    }))
+    .filter((c: MrrCharge) => !c.blocked);
+
+  // ---- current MRR (charges active right now) ----
+  // Match MySQL's case-/trailing-space-insensitive `status='ACTIVE'` semantics
+  // so the JS reconstruction lines up exactly with SQL aggregates.
+  const isActive = (s: string | null) => String(s ?? "").trim().toUpperCase() === "ACTIVE";
+  const activeAll = charges.filter((c) => isActive(c.status));
+  // Collapse multiple active charges per merchant to their single current one,
+  // so a stale/duplicate active row can't double-count toward MRR.
+  const activeNow = latestPerMerchant(activeAll.filter((c) => !c.test)); // real MRR contributors
+  const activeTest = latestPerMerchant(activeAll.filter((c) => c.test)); // excluded from MRR, shown for visibility
+  let mrr = 0;
+  const payers = new Set<number>();
+  // per-plan accumulator holds both real (MRR) and test charge figures
+  const planMap = new Map<
+    string,
+    { subs: number; mrr: number; testSubs: number; testMrr: number }
+  >();
+  const planRow = (label: string) => {
+    let r = planMap.get(label);
+    if (!r) {
+      r = { subs: 0, mrr: 0, testSubs: 0, testMrr: 0 };
+      planMap.set(label, r);
+    }
+    return r;
+  };
+  let annualCount = 0;
+  let annualRaw = 0;
+  let monthlyCount = 0;
+  let monthlyMrr = 0;
+
+  for (const c of activeNow) {
+    const mv = monthlyValue(c.price, c.intv);
+    mrr += mv;
+    // "Paying" = actually contributing revenue; $0 free-plan subscriptions are
+    // active but not paying, so they must not dilute paying-merchant count / ARPA.
+    if (mv > 0) payers.add(c.user_id);
+    const pm = planRow(c.plan);
+    pm.subs += 1;
+    pm.mrr += mv;
+    if (String(c.intv).toUpperCase() === "ANNUAL") {
+      annualCount += 1;
+      annualRaw += c.price;
+    } else {
+      monthlyCount += 1;
+      monthlyMrr += c.price;
+    }
+  }
+
+  // fold active test charges into the same plan rows (kept out of MRR)
+  let testMrrExcluded = 0;
+  for (const c of activeTest) {
+    const mv = monthlyValue(c.price, c.intv);
+    testMrrExcluded += mv;
+    const pm = planRow(c.plan);
+    pm.testSubs += 1;
+    pm.testMrr += mv;
+  }
+
+  const byPlan = Array.from(planMap.entries())
+    .map(([label, v]) => ({
+      label,
+      subscriptions: v.subs,
+      mrr: Math.round(v.mrr * 100) / 100,
+      avg: v.subs ? Math.round((v.mrr / v.subs) * 100) / 100 : 0,
+      share: mrr ? Math.round((v.mrr / mrr) * 1000) / 10 : 0,
+      testSubscriptions: v.testSubs,
+      testMrr: Math.round(v.testMrr * 100) / 100,
+    }))
+    .sort((a, b) => b.mrr - a.mrr || b.testMrr - a.testMrr);
+
+  const byInterval = [
+    { label: "Monthly (EVERY_30_DAYS)", subscriptions: monthlyCount, mrr: Math.round(monthlyMrr * 100) / 100 },
+    { label: "Annual (÷12 to monthly)", subscriptions: annualCount, mrr: Math.round((annualRaw / 12) * 100) / 100 },
+  ].filter((r) => r.subscriptions > 0);
+
+  // ---- 12-month MRR time series (reconstructed from activation/cancellation) ----
+  // A charge contributes to month M if it was activated on/before month-end and
+  // not yet cancelled by month-end. new/churned track movement within the month.
+  const now = new Date();
+  const series: {
+    bucket: string;
+    count: number; // = MRR at month end (ColumnChart reads `count`)
+    mrr: number;
+    newMrr: number;
+    churnedMrr: number;
+    net: number;
+  }[] = [];
+
+  // real (non-test) charges only; test never counts toward the trend
+  const realCharges = charges.filter((c) => !c.test && c.activatedTs != null);
+  // A charge that is ACTIVE right now has not churned, even if it carries a
+  // stale cancelled_on date — trust status over the timestamp.
+  const effCancel = (c: MrrCharge) => (isActive(c.status) ? null : c.cancelledTs);
+
+  for (let i = months - 1; i >= 0; i--) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const monthStart = d.getTime();
+    const monthEnd = new Date(d.getFullYear(), d.getMonth() + 1, 1).getTime() - 1;
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+
+    // Reconstruct month-end MRR one subscription per merchant: among each
+    // merchant's charges active at month-end, keep only the latest-activated one
+    // (so overlapping plan-change charges don't double-count historically too).
+    const bestActive = new Map<number, MrrCharge>();
+    let newMrr = 0;
+    let churnedMrr = 0;
+    for (const c of realCharges) {
+      const ec = effCancel(c);
+      if (c.activatedTs! <= monthEnd && (ec == null || ec > monthEnd)) {
+        const cur = bestActive.get(c.user_id);
+        if (!cur || c.activatedTs! > cur.activatedTs! || (c.activatedTs! === cur.activatedTs! && c.chargeId > cur.chargeId)) {
+          bestActive.set(c.user_id, c);
+        }
+      }
+      if (c.activatedTs! >= monthStart && c.activatedTs! <= monthEnd) newMrr += monthlyValue(c.price, c.intv);
+      if (ec != null && ec >= monthStart && ec <= monthEnd) churnedMrr += monthlyValue(c.price, c.intv);
+    }
+    let active = 0;
+    for (const c of bestActive.values()) active += monthlyValue(c.price, c.intv);
+    series.push({
+      bucket: key,
+      count: Math.round(active * 100) / 100,
+      mrr: Math.round(active * 100) / 100,
+      newMrr: Math.round(newMrr * 100) / 100,
+      churnedMrr: Math.round(churnedMrr * 100) / 100,
+      net: Math.round((newMrr - churnedMrr) * 100) / 100,
+    });
+  }
+
+  // month-over-month growth on the reconstructed series
+  const last = series[series.length - 1]?.mrr ?? 0;
+  const prev = series[series.length - 2]?.mrr ?? 0;
+  const momGrowth = prev ? ((last - prev) / prev) * 100 : 0;
+
+  // top active subscriptions (the detail behind the number). Each row is one
+  // merchant's subscription — include the shop so equally-priced rows (e.g. lots
+  // of $49.99 Business plans) are distinguishable rather than looking duplicated.
+  const topSlice = [...activeNow]
+    .sort((a, b) => monthlyValue(b.price, b.intv) - monthlyValue(a.price, a.intv))
+    .slice(0, 25);
+  const topIds = Array.from(new Set(topSlice.map((c) => c.user_id))).filter(Boolean);
+  const shopInfo = new Map<number, { name: string; website: string | null }>();
+  if (topIds.length) {
+    await safe(async () => {
+      const us = await query<any>(
+        `SELECT id, name, email,
+                CASE WHEN JSON_VALID(meta_data)
+                     THEN NULLIF(JSON_UNQUOTE(JSON_EXTRACT(meta_data,'$.storefront_domain')),'')
+                     END AS website
+           FROM users WHERE id IN (?)`,
+        [topIds]
+      );
+      us.forEach((u) =>
+        shopInfo.set(num(u.id), {
+          name: u.name || u.email || `Shop #${u.id}`,
+          website: u.website && u.website !== "null" ? String(u.website) : null,
+        })
+      );
+    });
+  }
+  const topSubs = topSlice.map((c) => {
+    const info = shopInfo.get(c.user_id);
+    return {
+      shopId: c.user_id,
+      shop: info?.name || `Shop #${c.user_id}`,
+      // real store website from meta_data.storefront_domain (may differ from the
+      // myshopify name); null when we don't have it.
+      website: info?.website || null,
+      plan: c.plan,
+      interval: String(c.intv).toUpperCase() === "ANNUAL" ? "Annual" : "Monthly",
+      price: c.price,
+      monthly: Math.round(monthlyValue(c.price, c.intv) * 100) / 100,
+    };
+  });
+
+  const testActiveRaw = activeTest.reduce((s, c) => s + c.price, 0);
+  // The original buggy figure: SUM(price) of EVERY active charge — including
+  // test, blocked merchants and duplicate active rows, with annual NOT
+  // normalized. Computed from the raw rows so it stays a fixed "before" baseline.
+  const naiveActiveRevenue = rows
+    .filter((r: any) => isActive(r.status))
+    .reduce((s: number, r: any) => s + num(r.price), 0);
+  const payingMerchants = payers.size;
+
+  return {
+    mrr: Math.round(mrr * 100) / 100,
+    arr: Math.round(mrr * 12 * 100) / 100,
+    activeSubs: activeNow.length,
+    payingMerchants,
+    arpa: payingMerchants ? Math.round((mrr / payingMerchants) * 100) / 100 : 0,
+    momGrowth: Math.round(momGrowth * 10) / 10,
+    annual: {
+      count: annualCount,
+      rawAnnual: Math.round(annualRaw * 100) / 100,
+      monthlyEquivalent: Math.round((annualRaw / 12) * 100) / 100,
+    },
+    monthly: { count: monthlyCount, mrr: Math.round(monthlyMrr * 100) / 100 },
+    test: {
+      excludedActive: activeTest.length,
+      excludedActiveRaw: Math.round(testActiveRaw * 100) / 100,
+      excludedActiveMrr: Math.round(testMrrExcluded * 100) / 100,
+      excludedTotal: charges.filter((c) => c.test).length,
+    },
+    // the old, incorrect figure (sum of all active prices incl. test, annual not
+    // normalized) — surfaced so the page can show what was being over-reported.
+    naiveActiveRevenue: Math.round(naiveActiveRevenue * 100) / 100,
+    byPlan,
+    byInterval,
+    series,
+    topSubs,
   };
 }
 
@@ -745,7 +1058,7 @@ export async function getConversion() {
         scalarRow(
           `SELECT
              (SELECT COUNT(*) FROM users WHERE deleted_at IS NULL) active,
-             (SELECT COUNT(DISTINCT user_id) FROM charges WHERE status='ACTIVE' AND deleted_at IS NULL) paying,
+             (SELECT COUNT(DISTINCT user_id) FROM charges WHERE status='ACTIVE' AND deleted_at IS NULL AND test=0) paying,
              (SELECT COUNT(*) FROM users WHERE deleted_at IS NULL AND shopify_freemium=1) freemium`
         )
       ),
@@ -963,7 +1276,7 @@ export async function getShops(f: ShopFilters) {
       safe(async () => {
         const r = await query<any>(
           `SELECT user_id, SUM(price) total FROM charges
-            WHERE status='ACTIVE' AND deleted_at IS NULL AND user_id IN (?) GROUP BY user_id`,
+            WHERE status='ACTIVE' AND deleted_at IS NULL AND test=0 AND user_id IN (?) GROUP BY user_id`,
           [ids]
         );
         r.forEach((x) => charged.set(num(x.user_id), num(x.total)));
@@ -1054,16 +1367,18 @@ export async function getShopDetail(idRaw: string | number) {
         [id]
       )
     ),
-    safe(() => count("charges", `user_id=${id} AND status='ACTIVE' AND deleted_at IS NULL`)),
-    safe(() => count("charges", `user_id=${id} AND status='CANCELLED'`)),
+    safe(() => count("charges", `user_id=${id} AND status='ACTIVE' AND deleted_at IS NULL AND test=0`)),
+    safe(() => count("charges", `user_id=${id} AND status='CANCELLED' AND test=0`)),
     safe(async () =>
       num((await scalarRow<{ c: number }>(
-        `SELECT SUM(price) c FROM charges WHERE user_id=${id} AND status='ACTIVE' AND deleted_at IS NULL`
+        // active recurring revenue (MRR) for this shop — test excluded, annual normalized
+        `SELECT SUM(CASE WHEN \`interval\`='ANNUAL' THEN price/12 ELSE price END) c
+           FROM charges WHERE user_id=${id} AND status='ACTIVE' AND deleted_at IS NULL AND test=0`
       )).c)
     ),
     safe(async () =>
       num((await scalarRow<{ c: number }>(
-        `SELECT SUM(price) c FROM charges WHERE user_id=${id}`
+        `SELECT SUM(price) c FROM charges WHERE user_id=${id} AND test=0`
       )).c)
     ),
     safe(async () =>
